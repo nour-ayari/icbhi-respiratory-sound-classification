@@ -45,5 +45,5 @@ LABEL_NAMES = ['Normal', 'Crackle', 'Wheeze', 'Both']
 SEED        = 42
 
 # ── Device ────────────────────────────────────────────
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+DEVICE = 'cpu'
 print(f"Device : {DEVICE}")

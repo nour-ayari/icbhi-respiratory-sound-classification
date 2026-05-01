@@ -1,125 +1,124 @@
+
+
 import torch
 import torch.nn as nn
-from config import NUM_CLASSES
+import torch.nn.functional as F
+from transformers import ASTModel
 
 
-class MultiScaleResidualBlock(nn.Module):
-    """
-    Bloc multi-échelle avec connexion résiduelle légère.
-    Plus stable que le bloc purement concat+proj.
-    """
-    def __init__(self, in_ch, out_ch):
+class CustomAST(nn.Module):
+    def __init__(
+        self,
+        num_classes: int = 4,
+        pretrained_name: str = "MIT/ast-finetuned-audioset-10-10-0.4593",
+        dropout: float = 0.4,
+        freeze_ast: bool = True,
+        # Dimensions attendues par ce modèle AST pré-entraîné (patch 10x10)
+        # mel_bins=128, max_length=1024  → position embeddings figés à ces valeurs
+        ast_mel_bins: int = 128,
+        ast_max_length: int = 1024,
+    ):
         super().__init__()
 
-        b1 = out_ch // 4
-        b2 = out_ch // 4
-        b3 = out_ch // 4
-        b4 = out_ch - (b1 + b2 + b3)
+        self.ast_mel_bins   = ast_mel_bins
+        self.ast_max_length = ast_max_length
 
-        self.branch1 = nn.Sequential(
-            nn.Conv2d(in_ch, b1, kernel_size=(3, 3), padding=(1, 1), bias=False),
-            nn.BatchNorm2d(b1),
-            nn.ReLU(inplace=True)
-        )
-        self.branch2 = nn.Sequential(
-            nn.Conv2d(in_ch, b2, kernel_size=(3, 7), padding=(1, 3), bias=False),
-            nn.BatchNorm2d(b2),
-            nn.ReLU(inplace=True)
-        )
-        self.branch3 = nn.Sequential(
-            nn.Conv2d(in_ch, b3, kernel_size=(3, 11), padding=(1, 5), bias=False),
-            nn.BatchNorm2d(b3),
-            nn.ReLU(inplace=True)
-        )
-        self.branch4 = nn.Sequential(
-            nn.Conv2d(in_ch, b4, kernel_size=(5, 15), padding=(2, 7), bias=False),
-            nn.BatchNorm2d(b4),
-            nn.ReLU(inplace=True)
-        )
+        # ── Backbone ────────────────────────────────────────────
+        self.ast = ASTModel.from_pretrained(pretrained_name)
+        hidden_size = self.ast.config.hidden_size  # 768
 
-        self.proj = nn.Sequential(
-            nn.Conv2d(out_ch, out_ch, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_ch)
-        )
-
-        self.shortcut = (
-            nn.Identity()
-            if in_ch == out_ch else
-            nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
-                nn.BatchNorm2d(out_ch)
-            )
-        )
-
-        self.act = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        out = torch.cat([
-            self.branch1(x),
-            self.branch2(x),
-            self.branch3(x),
-            self.branch4(x)
-        ], dim=1)
-
-        out = self.proj(out)
-        out = out + self.shortcut(x)
-        return self.act(out)
-
-
-class CNNBiGRU(nn.Module):
-    """
-    Entrée : [B, 1, F, T]
-    Sortie : logits [B, num_classes]
-    """
-    def __init__(self, num_classes=NUM_CLASSES, gru_hidden=96, gru_layers=1):
-        super().__init__()
-
-        self.features = nn.Sequential(
-            MultiScaleResidualBlock(1, 32),
-            nn.MaxPool2d((2, 2)),
-            nn.Dropout2d(0.08),
-
-            MultiScaleResidualBlock(32, 64),
-            nn.MaxPool2d((2, 2)),
-            nn.Dropout2d(0.10),
-
-            MultiScaleResidualBlock(64, 128),
-            nn.MaxPool2d((2, 1)),   # préserve mieux l’axe temps
-            nn.Dropout2d(0.12),
-
-            MultiScaleResidualBlock(128, 160),
-            nn.Dropout2d(0.15)
-        )
-
-        # Compression fréquentielle uniquement
-        self.freq_pool = nn.AdaptiveAvgPool2d((1, None))
-
-        self.bigru = nn.GRU(
-            input_size=160,
-            hidden_size=gru_hidden,
-            num_layers=gru_layers,
-            batch_first=True,
-            bidirectional=True,
-            dropout=0.0 if gru_layers == 1 else 0.2
-        )
-
+        # ── Tête de classification ───────────────────────────────
+        # Deux couches + dropout agressif pour éviter l'overfitting
+        # sur un dataset médical limité
         self.classifier = nn.Sequential(
-            nn.Linear(gru_hidden * 2, 128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.35),
-            nn.Linear(128, num_classes)
+            nn.LayerNorm(hidden_size),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 512),
+            nn.GELU(),
+            nn.Dropout(dropout / 2),
+            nn.Linear(512, 128),
+            nn.GELU(),
+            nn.Dropout(dropout / 4),
+            nn.Linear(128, num_classes),
         )
 
-    def forward(self, x):
-        x = self.features(x)          # [B, 160, F', T']
-        x = self.freq_pool(x)         # [B, 160, 1, T']
-        x = x.squeeze(2)              # [B, 160, T']
-        x = x.permute(0, 2, 1)        # [B, T', 160]
-        self.bigru.flatten_parameters()  # ← ajouter
+        if freeze_ast:
+            self.freeze_backbone()
 
-        seq, _ = self.bigru(x)        # [B, T', 2H]
+    # ── Gestion du freeze ────────────────────────────────────────
+    def freeze_backbone(self):
+        """Gèle tout le backbone AST (phase 1 : warmup classifier)."""
+        for p in self.ast.parameters():
+            p.requires_grad = False
 
-        # Mean pooling temporel
-        x = seq.mean(dim=1)           # [B, 2H]
+    def unfreeze_last_layers(self, n_layers: int = 4):
+        """
+        Phase 2 : dégèle les n dernières couches Transformer + layernorm.
+        Garde le reste frozen pour ne pas perdre les features AudioSet.
+        """
+        # D'abord tout regeler
+        for p in self.ast.parameters():
+            p.requires_grad = False
 
-        return self.classifier(x)
+        # Dégeler les n dernières couches encoder
+        for layer in self.ast.encoder.layer[-n_layers:]:
+            for p in layer.parameters():
+                p.requires_grad = True
+
+        # LayerNorm final toujours entraînable
+        if hasattr(self.ast, "layernorm"):
+            for p in self.ast.layernorm.parameters():
+                p.requires_grad = True
+
+    def get_trainable_params(self) -> dict:
+        total    = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return {"total_M": total / 1e6, "trainable_M": trainable / 1e6}
+
+    # ── Forward ──────────────────────────────────────────────────
+    def _prepare_input(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Normalise x vers [B, ast_mel_bins, ast_max_length].
+
+        Ton preprocess produit [B, 1, 128, T] avec T variable (~157 frames).
+        L'AST MIT attend [B, 128, 1024].
+
+        STRATÉGIE : pad/crop en dimension temporelle uniquement (pas de resize
+        bilinéaire complet qui détruit les patterns fréquentiels).
+        On garde les 128 mel bins intacts.
+        """
+        # [B, 1, 128, T] → [B, 128, T]
+        if x.ndim == 4 and x.shape[1] == 1:
+            x = x.squeeze(1)
+
+        # Vérif bins mel
+        if x.shape[1] != self.ast_mel_bins:
+            # Rare, mais on resize seulement la dim fréquence si nécessaire
+            x = F.interpolate(
+                x.unsqueeze(1),
+                size=(self.ast_mel_bins, x.shape[-1]),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(1)
+
+        # Pad ou crop en dimension temporelle UNIQUEMENT
+        T = x.shape[-1]
+        if T < self.ast_max_length:
+            # Pad cyclique (reproduit le signal audio court)
+            repeats = (self.ast_max_length // T) + 1
+            x = x.repeat(1, 1, repeats)[:, :, : self.ast_max_length]
+        elif T > self.ast_max_length:
+            # Crop centré
+            start = (T - self.ast_max_length) // 2
+            x = x[:, :, start : start + self.ast_max_length]
+
+        return x  # [B, 128, 1024]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._prepare_input(x)          # [B, 128, 1024]
+        outputs = self.ast(x)               # last_hidden_state: [B, seq, 768]
+
+        # Mean pooling sur la séquence (plus stable que CLS seul)
+        embeddings = outputs.last_hidden_state.mean(dim=1)  # [B, 768]
+        logits = self.classifier(embeddings)                # [B, num_classes]
+        return logits

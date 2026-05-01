@@ -1,266 +1,536 @@
+"""
+train.py — Entraînement 2 phases avec SAM + CustomAST
+=======================================================
+
+PHASE 1 — WARMUP  (backbone frozen, classifier only)
+  - Objectif : faire converger la tête de classification
+  - Optimiseur : AdamW simple (pas SAM, backbone frozen = gradient trop limité)
+  - LR élevé sur classifier : 1e-3
+  - Durée : WARMUP_EPOCHS (défaut 5)
+
+PHASE 2 — FINE-TUNE  (n dernières couches + classifier)
+  - Objectif : adapter les features AudioSet aux sons pulmonaires
+  - Optimiseur : SAM(AdamW) avec rho=0.05
+  - LR faible sur backbone : 5e-6 | LR classifier : 1e-4
+  - Durée : FINETUNE_EPOCHS (défaut 20)
+
+RESUME :
+  --resume checkpoints/best_model.pth   → reprend là où on s'est arrêté
+
+CONVERGENCE CHECK :
+  - Logs clairs epoch par epoch
+  - Early stopping par patience séparée par phase
+  - Sauvegarde best + last checkpoint avec métadonnées complètes
+"""
+
 import os
 import sys
 import gc
+import argparse
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from sklearn.metrics import (
     confusion_matrix,
     classification_report,
     precision_recall_fscore_support,
-    accuracy_score
+    accuracy_score,
 )
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from config import *
 from src.dataset import get_datasets
-from src.model import CNNBiGRU
+from src.model import CustomAST
+from src.sam import SAM
+
+# ─────────────────────────────────────────────
+# CONFIG ENTRAÎNEMENT
+# ─────────────────────────────────────────────
+WARMUP_EPOCHS   = 5      # Phase 1 : classifier seulement
+FINETUNE_EPOCHS = 25     # Phase 2 : fine-tune backbone (partiel) + SAM
+WARMUP_LR       = 1e-3   # LR phase 1
+FINETUNE_LR_BB  = 5e-6   # LR backbone phase 2
+FINETUNE_LR_CLS = 1e-4   # LR classifier phase 2
+WEIGHT_DECAY    = 1e-2
+SAM_RHO         = 0.05
+N_UNFREEZE      = 4      # Nombre de couches encoder à dégeler en phase 2
+PATIENCE_P1     = 4      # Early stopping phase 1
+PATIENCE_P2     = 8      # Early stopping phase 2
+MIN_SP          = 0.20   # Spécificité minimale pour sauvegarder
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
 
-def icbhi_score(all_labels, all_preds):
-    cm = confusion_matrix(all_labels, all_preds, labels=[0, 1, 2, 3])
+# ─────────────────────────────────────────────
+# MÉTRIQUES
+# ─────────────────────────────────────────────
+def icbhi_score(labels, preds):
+    cm = confusion_matrix(labels, preds, labels=[0, 1, 2, 3])
     se = np.sum(cm[1:, 1:]) / (np.sum(cm[1:, :]) + 1e-8)
     sp = cm[0, 0] / (np.sum(cm[0, :]) + 1e-8)
     return float(se), float(sp), float((se + sp) / 2), cm
 
 
-def print_confusion_matrix(cm, class_names):
+def print_cm(cm, class_names):
     print("\nConfusion Matrix (rows=true, cols=pred):")
-    header = "true\\pred".ljust(12) + "".join([f"{name:>10}" for name in class_names])
+    header = "true\\pred".ljust(12) + "".join([f"{n:>10}" for n in class_names])
     print(header)
     print("-" * len(header))
     for i, row in enumerate(cm):
-        row_str = f"{class_names[i]:<12}" + "".join([f"{v:>10d}" for v in row])
-        print(row_str)
+        print(f"{class_names[i]:<12}" + "".join([f"{v:>10d}" for v in row]))
 
 
-def per_class_metrics(all_labels, all_preds, class_names):
-    precision, recall, f1, support = precision_recall_fscore_support(
-        all_labels, all_preds, labels=list(range(len(class_names))), zero_division=0
-    )
-    rows = []
-    for i, name in enumerate(class_names):
-        rows.append({
-            "class": name,
-            "precision": float(precision[i]),
-            "recall": float(recall[i]),
-            "f1": float(f1[i]),
-            "support": int(support[i])
-        })
-    return rows
+def build_class_weights(counts, device, mode="inv"):
+    """
+    mode='inv'     : w = 1/count  (fort contraste, utile si collapse)
+    mode='invsqrt' : w = 1/sqrt(count)  (plus doux)
+    """
+    counts_t = torch.tensor(counts, dtype=torch.float32)
+    if mode == "inv":
+        w = 1.0 / counts_t
+    else:
+        w = 1.0 / torch.sqrt(counts_t)
+    w = w / w.sum() * len(counts)   # normaliser pour que la somme = num_classes
+    print(f"Class weights ({mode}): "
+          + " | ".join([f"{LABEL_NAMES[i]}={w[i]:.3f}" for i in range(len(counts))]))
+    return w.to(device)
 
 
-def main():
-    os.makedirs(CKPT_DIR, exist_ok=True)
-    os.makedirs(RES_DIR, exist_ok=True)
+# ─────────────────────────────────────────────
+# EVAL LOOP
+# ─────────────────────────────────────────────
+def evaluate(model, loader, criterion, device):
+    model.eval()
+    total_loss = 0.0
+    all_preds, all_labels = [], []
 
-    train_dataset, test_dataset = get_datasets()
+    with torch.no_grad():
+        for mel, _, label in loader:
+            mel = mel.to(device, non_blocking=True)
+            logits = model(mel)
+            # label est un int dans le test loader
+            target = torch.tensor(label, dtype=torch.long).to(device) \
+                     if not isinstance(label, torch.Tensor) \
+                     else label.to(device)
 
-    labels_arr = train_dataset.L
-    counts = np.bincount(labels_arr, minlength=NUM_CLASSES)
-    print("Train class counts:", dict(zip(LABEL_NAMES, counts.tolist())))
+            loss = criterion(logits, target)
+            total_loss += loss.item()
 
-    # sampler modéré
-    sample_weights = [1.0 / np.sqrt(counts[l]) for l in labels_arr]
-    sampler = WeightedRandomSampler(
-        weights=torch.DoubleTensor(sample_weights),
-        num_samples=len(sample_weights),
-        replacement=True
-    )
+            preds = torch.argmax(logits, dim=1).cpu().tolist()
+            all_preds.extend(preds)
+            all_labels.extend(
+                label.tolist() if isinstance(label, torch.Tensor) else list(label)
+            )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        sampler=sampler,
-        num_workers=0,
-        pin_memory=True
-    )
+    acc = accuracy_score(all_labels, all_preds)
+    se, sp, score, cm = icbhi_score(all_labels, all_preds)
+    avg_loss = total_loss / max(len(loader), 1)
 
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True
-    )
+    pred_counts = np.bincount(all_preds, minlength=NUM_CLASSES)
+    true_counts = np.bincount(all_labels, minlength=NUM_CLASSES)
 
-    model = CNNBiGRU().to(DEVICE)
+    return {
+        "loss": avg_loss, "acc": acc, "se": se, "sp": sp, "score": score,
+        "cm": cm, "all_labels": all_labels, "all_preds": all_preds,
+        "pred_counts": pred_counts, "true_counts": true_counts,
+    }
 
-    total = sum(p.numel() for p in model.parameters())
-    trainp = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Params total : {total/1e6:.2f}M | Entraînables : {trainp/1e6:.2f}M")
 
-    class_counts = torch.tensor([3642., 1864., 886., 506.])
-    class_weights = 1.0 / torch.sqrt(class_counts)
-    class_weights = class_weights / class_weights.sum() * NUM_CLASSES
-    criterion = nn.CrossEntropyLoss(weight=class_weights.to(DEVICE))
-   
+# ─────────────────────────────────────────────
+# SAVE / LOAD
+# ─────────────────────────────────────────────
+def save_checkpoint(path, model, optimizer, epoch, phase, metrics, is_best=False):
+    ckpt = {
+        "epoch":        epoch,
+        "phase":        phase,
+        "model_state":  model.state_dict(),
+        "optim_state":  optimizer.state_dict()
+                        if not isinstance(optimizer, SAM)
+                        else optimizer.base_optimizer.state_dict(),
+        "score":        metrics["score"],
+        "se":           metrics["se"],
+        "sp":           metrics["sp"],
+        "acc":          metrics["acc"],
+    }
+    torch.save(ckpt, path)
+    tag = "★ BEST" if is_best else "last"
+    print(f"  [{tag}] Sauvegardé → {path}")
+
+
+def load_checkpoint(path, model, optimizer=None):
+    ckpt = torch.load(path, map_location="cpu")
+    model.load_state_dict(ckpt["model_state"])
+    if optimizer is not None and "optim_state" in ckpt:
+        try:
+            if isinstance(optimizer, SAM):
+                optimizer.base_optimizer.load_state_dict(ckpt["optim_state"])
+            else:
+                optimizer.load_state_dict(ckpt["optim_state"])
+        except Exception:
+            print("  Warning: état optimizer incompatible, ignoré.")
+    print(f"  Checkpoint chargé : epoch {ckpt['epoch']} | phase {ckpt['phase']} "
+          f"| score {ckpt['score']:.4f}")
+    return ckpt
+
+
+# ─────────────────────────────────────────────
+# PHASE 1 — WARMUP
+# ─────────────────────────────────────────────
+def phase1_warmup(model, train_loader, test_loader, criterion, device,
+                  ckpt_dir, res_dir, start_epoch=1):
+    """
+    Entraîne seulement la tête de classification (backbone frozen).
+    Utilise AdamW simple (SAM est inutile ici, presque rien à perturber).
+    """
+    print(f"\n{'='*60}")
+    print(f"  PHASE 1 : WARMUP CLASSIFIER ({WARMUP_EPOCHS} epochs max)")
+    print(f"{'='*60}")
+
+    p = model.get_trainable_params()
+    print(f"  Params entraînables : {p['trainable_M']:.2f}M / {p['total_M']:.2f}M")
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=LR,
-        weight_decay=WEIGHT_DECAY
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=WARMUP_LR,
+        weight_decay=WEIGHT_DECAY,
     )
-
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=EPOCHS,
-        eta_min=1e-6
+        optimizer, T_max=WARMUP_EPOCHS, eta_min=1e-5
     )
+    scaler = torch.amp.GradScaler(enabled=(device == "cuda"))
 
-    scaler = torch.amp.GradScaler(enabled=(DEVICE == "cuda"))
+    history, best_score, best_epoch, no_improve = [], 0.0, 0, 0
 
-    history = []
-    best_score = 0.0
-    best_epoch = 0
-    no_improve = 0
-    PATIENCE = 12
+    print(f"\n{'Ep':>4} {'Phase':>8} {'TrLoss':>8} {'EvLoss':>8} "
+          f"{'Acc':>7} {'Se':>7} {'Sp':>7} {'Score':>8}")
+    print("-" * 70)
 
-    print(f"\nEntraînement {DEVICE} — {EPOCHS} epochs")
-    print(f"{'Ep':>4} {'Loss':>8} {'Acc':>8} {'Se':>8} {'Sp':>8} {'Score':>8}")
-    print("-" * 56)
-
-    for epoch in range(1, EPOCHS + 1):
-        # ---------------- TRAIN ----------------
+    for epoch in range(start_epoch, WARMUP_EPOCHS + 1):
         model.train()
         running_loss = 0.0
 
         for i, (mel, target, _) in enumerate(train_loader, 1):
-            mel = mel.to(DEVICE, non_blocking=True)
-            target = target.to(DEVICE, non_blocking=True)
-            target = torch.argmax(target, dim=1)  # one-hot -> labels
+            mel    = mel.to(device, non_blocking=True)
+            target = torch.argmax(
+                target.to(device, non_blocking=True), dim=1
+            )
 
             optimizer.zero_grad(set_to_none=True)
-
-            with torch.amp.autocast(device_type='cuda', enabled=(DEVICE == 'cuda')):
+            with torch.amp.autocast(device_type="cuda", enabled=(device == "cuda")):
                 logits = model(mel)
-                loss = criterion(logits, target)
+                loss   = criterion(logits, target)
 
             if torch.isnan(loss):
-                print(f"NaN batch {i} — skip")
+                print(f"  NaN batch {i} — skip")
                 continue
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
-
             running_loss += loss.item()
 
-            if i == 1 or i % 50 == 0:
-                print(f"  Batch {i}/{len(train_loader)} | Loss {loss.item():.4f}", flush=True)
-
         scheduler.step()
-        gc.collect()
-        if DEVICE == "cuda":
-            torch.cuda.empty_cache()
 
-        # ---------------- EVAL ----------------
-        model.eval()
-        all_preds, all_labels = [], []
-
-        with torch.no_grad():
-            for mel, _, label in test_loader:
-                mel = mel.to(DEVICE, non_blocking=True)
-                logits = model(mel)
-                preds = torch.argmax(logits, dim=1).cpu().tolist()
-
-                all_preds.extend(preds)
-                all_labels.extend(label.tolist())
-
-        acc = accuracy_score(all_labels, all_preds)
-        se, sp, score, cm = icbhi_score(all_labels, all_preds)
+        metrics = evaluate(model, test_loader, criterion, device)
         avg_loss = running_loss / max(len(train_loader), 1)
 
-        class_rows = per_class_metrics(all_labels, all_preds, LABEL_NAMES)
+        print(f"{epoch:>4} {'warmup':>8} {avg_loss:>8.4f} {metrics['loss']:>8.4f} "
+              f"{metrics['acc']:>7.4f} {metrics['se']:>7.4f} "
+              f"{metrics['sp']:>7.4f} {metrics['score']:>8.4f}", end="")
 
-        row = {
-            "epoch": epoch,
-            "loss": avg_loss,
-            "accuracy": acc,
-            "Se": se,
-            "Sp": sp,
-            "Score": score
-        }
+        # Diagnostic collapse
+        pred_dist = dict(zip(LABEL_NAMES, metrics["pred_counts"].tolist()))
+        print(f"  preds={pred_dist}", end="")
 
-        for c in class_rows:
-            cname = c["class"]
-            row[f"{cname}_precision"] = c["precision"]
-            row[f"{cname}_recall"] = c["recall"]
-            row[f"{cname}_f1"] = c["f1"]
-            row[f"{cname}_support"] = c["support"]
-
-        history.append(row)
-
-        print(f"{epoch:>4} {avg_loss:>8.4f} {acc:>8.4f} {se:>8.4f} {sp:>8.4f} {score:>8.4f}", end="")
-
-        improved = (score > best_score and sp > 0.25)
-
+        improved = (metrics["score"] > best_score and metrics["sp"] > MIN_SP)
         if improved:
-            best_score = score
-            best_epoch = epoch
-            no_improve = 0
-            torch.save({
-                "epoch": epoch,
-                "model_state": model.state_dict(),
-                "score": score,
-                "se": se,
-                "sp": sp,
-                "acc": acc
-            }, os.path.join(CKPT_DIR, "best_model.pth"))
+            best_score, best_epoch, no_improve = metrics["score"], epoch, 0
+            save_checkpoint(
+                os.path.join(ckpt_dir, "best_p1.pth"),
+                model, optimizer, epoch, "warmup", metrics, is_best=True
+            )
             print("  ← best", end="")
         else:
             no_improve += 1
 
+        save_checkpoint(
+            os.path.join(ckpt_dir, "last_p1.pth"),
+            model, optimizer, epoch, "warmup", metrics
+        )
         print()
 
-        # affichage détaillé toutes les 2 epochs
-        if epoch % 5 == 0 or epoch == 1:
+        # Rapport détaillé
+        if epoch % 2 == 0 or epoch == WARMUP_EPOCHS:
             print(classification_report(
-                all_labels,
-                all_preds,
-                target_names=LABEL_NAMES,
-                digits=3,
-                zero_division=0
+                metrics["all_labels"], metrics["all_preds"],
+                target_names=LABEL_NAMES, digits=3, zero_division=0
             ))
-            print_confusion_matrix(cm, LABEL_NAMES)
+            print_cm(metrics["cm"], LABEL_NAMES)
+            print(f"  True : {dict(zip(LABEL_NAMES, metrics['true_counts'].tolist()))}")
+            print(f"  Pred : {pred_dist}")
 
-            # distribution des prédictions
-            pred_counts = np.bincount(all_preds, minlength=NUM_CLASSES)
-            true_counts = np.bincount(all_labels, minlength=NUM_CLASSES)
+        history.append({
+            "epoch": epoch, "phase": "warmup",
+            "train_loss": avg_loss, **{k: v for k, v in metrics.items()
+                                       if k not in ("cm", "all_labels", "all_preds",
+                                                    "pred_counts", "true_counts")}
+        })
 
-            print("\nTrue counts :", dict(zip(LABEL_NAMES, true_counts.tolist())))
-            print("Pred counts :", dict(zip(LABEL_NAMES, pred_counts.tolist())))
+        gc.collect()
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
-            print("\nRappels importants :")
-            print("- recall faible pour une classe => le modèle rate cette classe")
-            print("- precision faible pour une classe => beaucoup de faux positifs pour cette classe")
-            print("- si une colonne de la matrice domine => modèle biaisé vers cette classe")
-            print("- si une ligne va vers une autre classe => confusion systématique")
-
-        # sauvegarder la confusion matrix brute de chaque epoch
-        cm_df = pd.DataFrame(cm, index=LABEL_NAMES, columns=LABEL_NAMES)
-        cm_df.to_csv(os.path.join(RES_DIR, f"confusion_matrix_epoch_{epoch}.csv"))
-
-        if no_improve >= PATIENCE:
-            print(f"\nEarly stopping epoch {epoch}")
+        if no_improve >= PATIENCE_P1:
+            print(f"\n  Early stopping phase 1 à epoch {epoch}")
             break
 
-    pd.DataFrame(history).to_csv(
-        os.path.join(RES_DIR, "training_history_detailed.csv"),
-        index=False
+    print(f"\n  Meilleur score phase 1 : {best_score:.4f} (epoch {best_epoch})")
+    return history, best_score
+
+
+# ─────────────────────────────────────────────
+# PHASE 2 — FINE-TUNE avec SAM
+# ─────────────────────────────────────────────
+def phase2_finetune(model, train_loader, test_loader, criterion, device,
+                    ckpt_dir, res_dir, start_epoch=1):
+    """
+    Dégèle les N dernières couches encoder + classifier.
+    Utilise SAM(AdamW) pour chercher des minima plats.
+    LR différencié : backbone << classifier.
+    """
+    print(f"\n{'='*60}")
+    print(f"  PHASE 2 : FINE-TUNE + SAM ({FINETUNE_EPOCHS} epochs max)")
+    print(f"  Dégel des {N_UNFREEZE} dernières couches encoder")
+    print(f"{'='*60}")
+
+    model.unfreeze_last_layers(N_UNFREEZE)
+    p = model.get_trainable_params()
+    print(f"  Params entraînables : {p['trainable_M']:.2f}M / {p['total_M']:.2f}M")
+
+    # LR différencié : backbone très faible, tête plus haute
+    param_groups = [
+        {
+            "params": [p for p in model.ast.parameters() if p.requires_grad],
+            "lr": FINETUNE_LR_BB,
+            "weight_decay": WEIGHT_DECAY,
+        },
+        {
+            "params": model.classifier.parameters(),
+            "lr": FINETUNE_LR_CLS,
+            "weight_decay": WEIGHT_DECAY,
+        },
+    ]
+
+    base_optimizer = torch.optim.AdamW
+    optimizer = SAM(param_groups, base_optimizer, rho=SAM_RHO,
+                    lr=FINETUNE_LR_CLS, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer.base_optimizer,
+        T_max=FINETUNE_EPOCHS,
+        eta_min=1e-7
+    )
+    scaler = torch.amp.GradScaler(enabled=(device == "cuda"))
+
+    history, best_score, best_epoch, no_improve = [], 0.0, 0, 0
+
+    print(f"\n{'Ep':>4} {'Phase':>8} {'TrLoss':>8} {'EvLoss':>8} "
+          f"{'Acc':>7} {'Se':>7} {'Sp':>7} {'Score':>8}")
+    print("-" * 70)
+
+    for epoch in range(start_epoch, FINETUNE_EPOCHS + 1):
+        model.train()
+        running_loss = 0.0
+
+        for i, (mel, target, _) in enumerate(train_loader, 1):
+            mel    = mel.to(device, non_blocking=True)
+            target = torch.argmax(
+                target.to(device, non_blocking=True), dim=1
+            )
+
+            # ── SAM first step ──────────────────────────────
+            with torch.amp.autocast(device_type="cuda", enabled=(device == "cuda")):
+                logits = model(mel)
+                loss   = criterion(logits, target)
+
+            if torch.isnan(loss):
+                print(f"  NaN batch {i} — skip")
+                continue
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.first_step(zero_grad=True)
+            scaler.update()
+
+            # ── SAM second step ─────────────────────────────
+            scaler = torch.amp.GradScaler(enabled=(device == "cuda"))  # reset scaler
+            with torch.amp.autocast(device_type="cuda", enabled=(device == "cuda")):
+                logits2 = model(mel)
+                loss2   = criterion(logits2, target)
+
+            scaler.scale(loss2).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.second_step(zero_grad=True)
+            scaler.update()
+
+            running_loss += loss.item()
+
+        scheduler.step()
+
+        metrics = evaluate(model, test_loader, criterion, device)
+        avg_loss = running_loss / max(len(train_loader), 1)
+
+        print(f"{epoch:>4} {'finetune':>8} {avg_loss:>8.4f} {metrics['loss']:>8.4f} "
+              f"{metrics['acc']:>7.4f} {metrics['se']:>7.4f} "
+              f"{metrics['sp']:>7.4f} {metrics['score']:>8.4f}", end="")
+
+        pred_dist = dict(zip(LABEL_NAMES, metrics["pred_counts"].tolist()))
+        print(f"  preds={pred_dist}", end="")
+
+        improved = (metrics["score"] > best_score and metrics["sp"] > MIN_SP)
+        if improved:
+            best_score, best_epoch, no_improve = metrics["score"], epoch, 0
+            save_checkpoint(
+                os.path.join(ckpt_dir, "best_model.pth"),
+                model, optimizer, epoch, "finetune", metrics, is_best=True
+            )
+            print("  ← best", end="")
+        else:
+            no_improve += 1
+
+        save_checkpoint(
+            os.path.join(ckpt_dir, "last_p2.pth"),
+            model, optimizer, epoch, "finetune", metrics
+        )
+        print()
+
+        if epoch % 5 == 0 or epoch == 1:
+            print(classification_report(
+                metrics["all_labels"], metrics["all_preds"],
+                target_names=LABEL_NAMES, digits=3, zero_division=0
+            ))
+            print_cm(metrics["cm"], LABEL_NAMES)
+            print(f"  True : {dict(zip(LABEL_NAMES, metrics['true_counts'].tolist()))}")
+            print(f"  Pred : {pred_dist}")
+
+        history.append({
+            "epoch": epoch, "phase": "finetune",
+            "train_loss": avg_loss, **{k: v for k, v in metrics.items()
+                                       if k not in ("cm", "all_labels", "all_preds",
+                                                    "pred_counts", "true_counts")}
+        })
+
+        gc.collect()
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+        if no_improve >= PATIENCE_P2:
+            print(f"\n  Early stopping phase 2 à epoch {epoch}")
+            break
+
+    print(f"\n  Meilleur score phase 2 : {best_score:.4f} (epoch {best_epoch})")
+    return history, best_score
+
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume",    type=str,  default=None,
+                        help="Chemin vers un checkpoint pour reprendre")
+    parser.add_argument("--phase",     type=int,  default=0,
+                        help="0=les deux phases | 1=warmup only | 2=finetune only")
+    parser.add_argument("--warmup_ep", type=int,  default=WARMUP_EPOCHS)
+    parser.add_argument("--fine_ep",   type=int,  default=FINETUNE_EPOCHS)
+    args = parser.parse_args()
+
+    os.makedirs(CKPT_DIR, exist_ok=True)
+    os.makedirs(RES_DIR,  exist_ok=True)
+
+    # ── Data ────────────────────────────────────────────────────
+    train_dataset, test_dataset = get_datasets()
+
+    labels_arr = train_dataset.L
+    counts     = np.bincount(labels_arr, minlength=NUM_CLASSES)
+    print("Train class counts:", dict(zip(LABEL_NAMES, counts.tolist())))
+
+    # WeightedRandomSampler avec inv count (pas sqrt) → meilleure correction
+    sample_weights = [1.0 / counts[l] for l in labels_arr]
+    sampler = WeightedRandomSampler(
+        weights=torch.DoubleTensor(sample_weights),
+        num_samples=len(sample_weights),
+        replacement=True,
     )
 
-    print(f"\nMeilleur epoch : {best_epoch}")
-    print(f"Meilleur Score : {best_score:.4f}")
+    train_loader = DataLoader(
+        train_dataset, batch_size=BATCH_SIZE,
+        sampler=sampler, num_workers=0, pin_memory=True,
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=BATCH_SIZE,
+        shuffle=False, num_workers=0, pin_memory=True,
+    )
+
+    # ── Modèle ──────────────────────────────────────────────────
+    model = CustomAST(
+        num_classes=NUM_CLASSES,
+        dropout=0.4,
+        freeze_ast=True,     # commence frozen, phase 2 va dégeler
+    ).to(DEVICE)
+
+    p = model.get_trainable_params()
+    print(f"Params total : {p['total_M']:.2f}M | Entraînables : {p['trainable_M']:.2f}M")
+
+    # ── Loss avec class weights INV (pas sqrt) ──────────────────
+    # inv count = contraste fort, indispensable quand le modèle collapse
+    class_weights = build_class_weights(counts.tolist(), DEVICE, mode="inv")
+    criterion     = nn.CrossEntropyLoss(weight=class_weights)
+
+    # ── Resume ──────────────────────────────────────────────────
+    start_phase = 1
+    start_epoch = 1
+    if args.resume and os.path.isfile(args.resume):
+        print(f"\nReprise depuis : {args.resume}")
+        ckpt = torch.load(args.resume, map_location="cpu")
+        model.load_state_dict(ckpt["model_state"])
+        start_phase = 2 if ckpt.get("phase") == "warmup" else 2
+        start_epoch = ckpt.get("epoch", 1) + 1
+        print(f"  → Reprise phase {start_phase}, epoch {start_epoch}")
+
+    # ── Lancement des phases ─────────────────────────────────────
+    all_history = []
+
+    run_p1 = args.phase in (0, 1) and start_phase <= 1
+    run_p2 = args.phase in (0, 2)
+
+    if run_p1:
+        h1, score1 = phase1_warmup(
+            model, train_loader, test_loader, criterion, DEVICE,
+            CKPT_DIR, RES_DIR, start_epoch=start_epoch,
+        )
+        all_history.extend(h1)
+        start_epoch = 1  # réinitialise pour phase 2
+
+    if run_p2:
+        h2, score2 = phase2_finetune(
+            model, train_loader, test_loader, criterion, DEVICE,
+            CKPT_DIR, RES_DIR, start_epoch=start_epoch,
+        )
+        all_history.extend(h2)
+
+    # ── Sauvegarde historique ────────────────────────────────────
+    pd.DataFrame(all_history).to_csv(
+        os.path.join(RES_DIR, "training_history.csv"), index=False
+    )
+    print("\nHistorique sauvegardé → training_history.csv")
 
 
 if __name__ == "__main__":
