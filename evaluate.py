@@ -9,7 +9,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from config import *
 from src.dataset import get_datasets
-from src.model import HybridCNNAST
+from src.model import CustomAST
 
 def icbhi_score(all_labels, all_preds):
     cm = confusion_matrix(all_labels, all_preds, labels=[0,1,2,3])
@@ -37,16 +37,16 @@ def plot_training_curves(history_path, save_path):
     fig, axes = plt.subplots(1, 2, figsize=(13, 4))
 
     # Loss
-    axes[0].plot(df['epoch'], df['loss'], color='#E24B4A')
+    axes[0].plot(df['epoch'], df['train_loss'], color='#E24B4A')
     axes[0].set_title('Loss par epoch')
     axes[0].set_xlabel('Epoch')
     axes[0].set_ylabel('Loss')
     axes[0].grid(alpha=0.3)
 
     # Se / Sp / Score
-    axes[1].plot(df['epoch'], df['Se'],    label='Sensibilité (Se)', color='#1D9E75')
-    axes[1].plot(df['epoch'], df['Sp'],    label='Spécificité (Sp)', color='#378ADD')
-    axes[1].plot(df['epoch'], df['Score'], label='Score ICBHI',       color='#D4537E', linewidth=2)
+    axes[1].plot(df['epoch'], df['se'],    label='Sensibilité (Se)', color='#1D9E75')
+    axes[1].plot(df['epoch'], df['sp'],    label='Spécificité (Sp)', color='#378ADD')
+    axes[1].plot(df['epoch'], df['score'], label='Score ICBHI',       color='#D4537E', linewidth=2)
     axes[1].axhline(y=0.6831, color='gray', linestyle='--', label='Référence article (68.31%)')
     axes[1].set_title('Métriques par epoch')
     axes[1].set_xlabel('Epoch')
@@ -62,18 +62,19 @@ def main():
     os.makedirs(FIG_DIR, exist_ok=True)
 
     # 1. Charger données test
-    _, test_dataset, _ = get_datasets()
+    _, test_dataset = get_datasets()
     test_loader = DataLoader(
         test_dataset, batch_size=BATCH_SIZE,
         shuffle=False, num_workers=0
     )
 
-    # 2. Charger modèle
-    model = HybridCNNAST().to(DEVICE)
-    ckpt  = torch.load(
-        os.path.join(CKPT_DIR, "best_model.pth"),
-        map_location=DEVICE
-    )
+    # 2. Charger modèle — utilise best_model si dispo, sinon last_p2
+    ckpt_path = os.path.join(CKPT_DIR, "best_model.pth")
+    if not os.path.exists(ckpt_path):
+        ckpt_path = os.path.join(CKPT_DIR, "last_p2.pth")
+        print("best_model.pth introuvable → utilise last_p2.pth")
+    model = CustomAST(num_classes=NUM_CLASSES, dropout=0.2, freeze_ast=False).to(DEVICE)
+    ckpt  = torch.load(ckpt_path, map_location=DEVICE)
     model.load_state_dict(ckpt['model_state'])
     model.eval()
     print(f"Modèle chargé — epoch {ckpt['epoch']} | Score {ckpt['score']:.4f}")
