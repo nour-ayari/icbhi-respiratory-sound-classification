@@ -28,18 +28,14 @@ class CustomAST(nn.Module):
         hidden_size = self.ast.config.hidden_size  # 768
 
         # ── Tête de classification ───────────────────────────────
-        # Deux couches + dropout agressif pour éviter l'overfitting
-        # sur un dataset médical limité
+        # 2 couches comme le repo de référence mais avec LayerNorm
         self.classifier = nn.Sequential(
             nn.LayerNorm(hidden_size),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size, 512),
+            nn.Linear(hidden_size, 256),
             nn.GELU(),
             nn.Dropout(dropout / 2),
-            nn.Linear(512, 128),
-            nn.GELU(),
-            nn.Dropout(dropout / 4),
-            nn.Linear(128, num_classes),
+            nn.Linear(256, num_classes),
         )
 
         if freeze_ast:
@@ -112,7 +108,18 @@ class CustomAST(nn.Module):
             start = (T - self.ast_max_length) // 2
             x = x[:, :, start : start + self.ast_max_length]
 
-        return x  # [B, 128, 1024]
+        # ASTModel attend [B, time, mel] = [B, 1024, 128]
+        # Notre preprocess produit [B, mel, time] = [B, 128, 1024] → transposer
+        x = x.permute(0, 2, 1)  # [B, 1024, 128]
+
+        # Normaliser pour correspondre à la distribution ASTFeatureExtractor
+        # (le backbone a été pré-entraîné avec mean≈0, std≈0.5)
+        # Nos spectros sont en dB brut (mean≈-61, std≈19) → incompatible
+        mean = x.mean(dim=(-2, -1), keepdim=True)
+        std  = x.std(dim=(-2, -1), keepdim=True).clamp(min=1.0)  # min=1.0 fp16-safe
+        x = (x - mean) / (2.0 * std)  # std≈0.5, mean≈0 comme ASTFeatureExtractor
+
+        return x  # [B, 1024, 128]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self._prepare_input(x)          # [B, 128, 1024]

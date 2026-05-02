@@ -10,7 +10,7 @@ FIG_DIR    = os.path.join(BASE_DIR, "figures")
 
 # ── Audio ─────────────────────────────────────────────
 TARGET_SR  = 16000
-TARGET_SEC = 5         # ← remettre 8s, 5s perd trop d'info
+TARGET_SEC = 8
 TARGET_LEN = TARGET_SR * TARGET_SEC
 N_MELS     = 128
 N_FFT      = 1024
@@ -26,8 +26,8 @@ FREEZE_AST_LAYERS = 10
 
 # ── Entraînement ──────────────────────────────────────
 EPOCHS       = 25        # ← une seule définition
-BATCH_SIZE   = 16
-ACCUM_STEPS  = 2
+BATCH_SIZE   = 8
+ACCUM_STEPS  = 4   # effective batch = 8*4 = 32, same as before but VRAM-safe
 LR           = 1e-3
 WEIGHT_DECAY = 1e-4
 FOCAL_GAMMA  = 1.5

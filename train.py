@@ -55,7 +55,7 @@ WARMUP_LR       = 1e-3   # LR phase 1
 FINETUNE_LR_BB  = 5e-6   # LR backbone phase 2
 FINETUNE_LR_CLS = 1e-4   # LR classifier phase 2
 WEIGHT_DECAY    = 1e-2
-SAM_RHO         = 0.05
+SAM_RHO         = 0.01   
 N_UNFREEZE      = 4      # Nombre de couches encoder à dégeler en phase 2
 PATIENCE_P1     = 4      # Early stopping phase 1
 PATIENCE_P2     = 8      # Early stopping phase 2
@@ -220,7 +220,7 @@ def phase1_warmup(model, train_loader, test_loader, criterion, device,
             )
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device_type="cuda", enabled=(device == "cuda")):
+            with torch.amp.autocast(device_type=device, enabled=(device == "cuda")):
                 logits = model(mel)
                 loss   = criterion(logits, target)
 
@@ -248,7 +248,7 @@ def phase1_warmup(model, train_loader, test_loader, criterion, device,
         pred_dist = dict(zip(LABEL_NAMES, metrics["pred_counts"].tolist()))
         print(f"  preds={pred_dist}", end="")
 
-        improved = (metrics["score"] > best_score and metrics["sp"] > MIN_SP)
+        improved = metrics["score"] > best_score 
         if improved:
             best_score, best_epoch, no_improve = metrics["score"], epoch, 0
             save_checkpoint(
@@ -301,11 +301,10 @@ def phase2_finetune(model, train_loader, test_loader, criterion, device,
                     ckpt_dir, res_dir, start_epoch=1):
     """
     Dégèle les N dernières couches encoder + classifier.
-    Utilise SAM(AdamW) pour chercher des minima plats.
-    LR différencié : backbone << classifier.
+    Utilise AdamW + AMP. LR différencié : backbone << classifier.
     """
     print(f"\n{'='*60}")
-    print(f"  PHASE 2 : FINE-TUNE + SAM ({FINETUNE_EPOCHS} epochs max)")
+    print(f"  PHASE 2 : FINE-TUNE AdamW ({FINETUNE_EPOCHS} epochs max)")
     print(f"  Dégel des {N_UNFREEZE} dernières couches encoder")
     print(f"{'='*60}")
 
@@ -313,7 +312,6 @@ def phase2_finetune(model, train_loader, test_loader, criterion, device,
     p = model.get_trainable_params()
     print(f"  Params entraînables : {p['trainable_M']:.2f}M / {p['total_M']:.2f}M")
 
-    # LR différencié : backbone très faible, tête plus haute
     param_groups = [
         {
             "params": [p for p in model.ast.parameters() if p.requires_grad],
@@ -327,13 +325,9 @@ def phase2_finetune(model, train_loader, test_loader, criterion, device,
         },
     ]
 
-    base_optimizer = torch.optim.AdamW
-    optimizer = SAM(param_groups, base_optimizer, rho=SAM_RHO,
-                    lr=FINETUNE_LR_CLS, weight_decay=WEIGHT_DECAY)
+    optimizer = torch.optim.AdamW(param_groups)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer.base_optimizer,
-        T_max=FINETUNE_EPOCHS,
-        eta_min=1e-7
+        optimizer, T_max=FINETUNE_EPOCHS, eta_min=1e-7
     )
     scaler = torch.amp.GradScaler(enabled=(device == "cuda"))
 
@@ -347,37 +341,21 @@ def phase2_finetune(model, train_loader, test_loader, criterion, device,
         model.train()
         running_loss = 0.0
 
-        for i, (mel, target, _) in enumerate(train_loader, 1):
+        for mel, target, _ in train_loader:
             mel    = mel.to(device, non_blocking=True)
             target = torch.argmax(
                 target.to(device, non_blocking=True), dim=1
             )
 
-            # ── SAM first step ──────────────────────────────
-            with torch.amp.autocast(device_type="cuda", enabled=(device == "cuda")):
+            optimizer.zero_grad()
+            with torch.amp.autocast(device_type=device, enabled=(device == "cuda")):
                 logits = model(mel)
                 loss   = criterion(logits, target)
-
-            if torch.isnan(loss):
-                print(f"  NaN batch {i} — skip")
-                continue
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.first_step(zero_grad=True)
-            scaler.update()
-
-            # ── SAM second step ─────────────────────────────
-            scaler = torch.amp.GradScaler(enabled=(device == "cuda"))  # reset scaler
-            with torch.amp.autocast(device_type="cuda", enabled=(device == "cuda")):
-                logits2 = model(mel)
-                loss2   = criterion(logits2, target)
-
-            scaler.scale(loss2).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.second_step(zero_grad=True)
+            scaler.step(optimizer)
             scaler.update()
 
             running_loss += loss.item()
@@ -472,17 +450,17 @@ def main():
 
     train_loader = DataLoader(
         train_dataset, batch_size=BATCH_SIZE,
-        sampler=sampler, num_workers=0, pin_memory=True,
+        sampler=sampler, num_workers=0, pin_memory=torch.cuda.is_available(),
     )
     test_loader = DataLoader(
         test_dataset, batch_size=BATCH_SIZE,
-        shuffle=False, num_workers=0, pin_memory=True,
+        shuffle=False, num_workers=0, pin_memory=torch.cuda.is_available(),
     )
 
     # ── Modèle ──────────────────────────────────────────────────
     model = CustomAST(
         num_classes=NUM_CLASSES,
-        dropout=0.4,
+        dropout=0.2,         # 0.4 trop agressif avec backbone frozen
         freeze_ast=True,     # commence frozen, phase 2 va dégeler
     ).to(DEVICE)
 
@@ -492,7 +470,7 @@ def main():
     # ── Loss avec class weights INV (pas sqrt) ──────────────────
     # inv count = contraste fort, indispensable quand le modèle collapse
     class_weights = build_class_weights(counts.tolist(), DEVICE, mode="inv")
-    criterion     = nn.CrossEntropyLoss(weight=class_weights)
+    criterion     = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
 
     # ── Resume ──────────────────────────────────────────────────
     start_phase = 1
