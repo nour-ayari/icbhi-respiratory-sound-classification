@@ -9,7 +9,26 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from config import *
 from src.dataset import get_datasets
-from src.model import HybridCNNAST
+from src.model import CustomAST
+
+def predict_with_thresholds(logits, thresholds):
+    """Make predictions using per-class thresholds instead of argmax."""
+    probs = torch.softmax(logits, dim=1)
+    batch_size = probs.shape[0]
+    preds = []
+    
+    for i in range(batch_size):
+        confident_classes = [
+            cls for cls in range(NUM_CLASSES) 
+            if probs[i, cls].item() >= thresholds[cls]
+        ]
+        
+        if confident_classes:
+            preds.append(max(confident_classes, key=lambda c: probs[i, c].item()))
+        else:
+            preds.append(torch.argmax(probs[i]).item())
+    
+    return np.array(preds)
 
 def icbhi_score(all_labels, all_preds):
     cm = confusion_matrix(all_labels, all_preds, labels=[0,1,2,3])
@@ -69,21 +88,35 @@ def main():
     )
 
     # 2. Charger modèle
-    model = HybridCNNAST().to(DEVICE)
+    model = CustomAST(num_classes=NUM_CLASSES).to(DEVICE)
     ckpt  = torch.load(
         os.path.join(CKPT_DIR, "best_model.pth"),
         map_location=DEVICE
     )
     model.load_state_dict(ckpt['model_state'])
+    
+    # Load thresholds if they exist
+    thresholds = ckpt.get('thresholds')
+    if thresholds:
+        print(f"Thresholds loaded from checkpoint: {thresholds}")
+    else:
+        print("No thresholds in checkpoint, will use argmax")
+    
     model.eval()
     print(f"Modèle chargé — epoch {ckpt['epoch']} | Score {ckpt['score']:.4f}")
 
-    # 3. Inférence
+    # 3. Inférence (using thresholds if available for better sensitivity)
     all_preds, all_labels = [], []
     with torch.no_grad():
         for mel, target, label in test_loader:
             logits = model(mel.to(DEVICE))
-            preds  = torch.argmax(logits, dim=1).cpu().tolist()
+            
+            # Use thresholds if available, otherwise use argmax
+            if thresholds is not None:
+                preds = predict_with_thresholds(logits, thresholds).tolist()
+            else:
+                preds = torch.argmax(logits, dim=1).cpu().tolist()
+            
             all_preds.extend(preds)
             all_labels.extend(label.tolist())
 

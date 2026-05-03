@@ -37,7 +37,7 @@ RHO_SAM      = 0.01
 USE_SPECAUGMENT = True
 USE_MIXUP       = True
 P_PITCH         = 0.4   # ← réactiver
-P_MIXUP         = 0.3   # ← réactiver modérément
+P_MIXUP         = 0.1   # REDUCED from 0.3 to avoid unrealistic blended audio
 RARE_CLASSES    = [2, 3]
 
 # ── Divers ────────────────────────────────────────────

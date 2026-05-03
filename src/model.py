@@ -27,6 +27,15 @@ class CustomAST(nn.Module):
         self.ast = ASTModel.from_pretrained(pretrained_name)
         hidden_size = self.ast.config.hidden_size  # 768
 
+        # ── Attention Pooling ────────────────────────────────────
+        # Learns weighted combination of transformer tokens instead of simple mean
+        # WHY: Allows model to focus on most discriminative temporal regions
+        self.attention_pool = nn.Sequential(
+            nn.Linear(hidden_size, 128),
+            nn.Tanh(),
+            nn.Linear(128, 1),
+        )
+
         # ── Tête de classification ───────────────────────────────
         # Deux couches + dropout agressif pour éviter l'overfitting
         # sur un dataset médical limité
@@ -118,7 +127,13 @@ class CustomAST(nn.Module):
         x = self._prepare_input(x)          # [B, 128, 1024]
         outputs = self.ast(x)               # last_hidden_state: [B, seq, 768]
 
-        # Mean pooling sur la séquence (plus stable que CLS seul)
-        embeddings = outputs.last_hidden_state.mean(dim=1)  # [B, 768]
-        logits = self.classifier(embeddings)                # [B, num_classes]
+        # ATTENTION POOLING (instead of mean pooling)
+        # WHY: Learns which time-frequency regions are most important for classification
+        # Allows model to focus on crackles/wheezes at specific temporal locations
+        hidden = outputs.last_hidden_state  # [B, seq, 768]
+        attn_weights = self.attention_pool(hidden)  # [B, seq, 1]
+        attn_weights = F.softmax(attn_weights, dim=1)  # [B, seq, 1], normalized
+        embeddings = (hidden * attn_weights).sum(dim=1)  # [B, 768], weighted sum
+        
+        logits = self.classifier(embeddings)  # [B, num_classes]
         return logits

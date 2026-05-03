@@ -45,6 +45,7 @@ from config import *
 from src.dataset import get_datasets
 from src.model import CustomAST
 from src.sam import SAM
+from src.losses import FocalLoss
 
 # ─────────────────────────────────────────────
 # CONFIG ENTRAÎNEMENT
@@ -60,6 +61,7 @@ N_UNFREEZE      = 4      # Nombre de couches encoder à dégeler en phase 2
 PATIENCE_P1     = 4      # Early stopping phase 1
 PATIENCE_P2     = 8      # Early stopping phase 2
 MIN_SP          = 0.20   # Spécificité minimale pour sauvegarder
+LOG_EVERY       = 50     # Affiche progression intra-epoch toutes les N batches
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
@@ -84,34 +86,157 @@ def print_cm(cm, class_names):
         print(f"{class_names[i]:<12}" + "".join([f"{v:>10d}" for v in row]))
 
 
-def build_class_weights(counts, device, mode="inv"):
+def build_class_weights(counts, device, beta=0.9999):
     """
-    mode='inv'     : w = 1/count  (fort contraste, utile si collapse)
-    mode='invsqrt' : w = 1/sqrt(count)  (plus doux)
+    Effective number of samples per class: (1 - beta) / (1 - beta^n)
+    
+    WHY: Better handles extreme imbalance than 1/count.
+    - As beta → 1, approaches 1/n (strong weighting)
+    - Smoother than inverse count, less extreme
+    - Standard in imbalanced learning literature
+    
+    Args:
+        counts: list of class counts
+        device: torch device
+        beta: decay rate (default 0.9999)
+    
+    Returns:
+        weights tensor normalized so sum = num_classes
     """
     counts_t = torch.tensor(counts, dtype=torch.float32)
-    if mode == "inv":
-        w = 1.0 / counts_t
-    else:
-        w = 1.0 / torch.sqrt(counts_t)
-    w = w / w.sum() * len(counts)   # normaliser pour que la somme = num_classes
-    print(f"Class weights ({mode}): "
+    effective_n = 1.0 - torch.pow(beta, counts_t)
+    w = (1.0 - beta) / (effective_n + 1e-8)
+    w = w / w.sum() * len(counts)  # normalize to sum to num_classes
+    print(f"Class weights (effective_n, beta={beta}): "
           + " | ".join([f"{LABEL_NAMES[i]}={w[i]:.3f}" for i in range(len(counts))]))
     return w.to(device)
 
 
 # ─────────────────────────────────────────────
+# THRESHOLD TUNING FOR SENSITIVITY MAXIMIZATION
+# ─────────────────────────────────────────────
+def tune_thresholds_for_sensitivity(model, loader, device, min_sp=0.20):
+    """
+    Tune per-class decision thresholds to maximize sensitivity (recall),
+    while keeping specificity >= min_sp.
+    
+    WHY: Standard argmax predictions treat all classes equally.
+    Medical audio classification should prioritize RECALL for abnormal classes
+    (Crackle, Wheeze, Both), even if it slightly reduces specificity.
+    
+    Strategy:
+    1. Get softmax probabilities for each sample
+    2. For each class, vary threshold from 0 to 1
+    3. Select threshold that maximizes sensitivity subject to specificity >= min_sp
+    
+    Returns:
+        thresholds: dict mapping class_id → float threshold
+        metrics: dict with tuning details
+    """
+    model.eval()
+    all_probs, all_labels = [], []
+    
+    with torch.no_grad():
+        for mel, _, label in loader:
+            mel = mel.to(device, non_blocking=True)
+            logits = model(mel)
+            probs = torch.softmax(logits, dim=1)  # [B, 4]
+            all_probs.append(probs.cpu().numpy())
+            all_labels.extend(label.tolist() if isinstance(label, torch.Tensor) else list(label))
+    
+    all_probs = np.concatenate(all_probs, axis=0)  # [N, 4]
+    all_labels = np.array(all_labels)
+    
+    best_thresholds = {}
+    tuning_log = {}
+    
+    # For each class, find best threshold
+    for cls in range(NUM_CLASSES):
+        # Binary task: class vs all others
+        is_cls = (all_labels == cls).astype(int)
+        cls_probs = all_probs[:, cls]
+        
+        best_threshold = 0.5
+        best_se = 0.0
+        
+        # Grid search over thresholds
+        for thresh in np.linspace(0, 1, 101):
+            pred_cls = (cls_probs >= thresh).astype(int)
+            
+            # Compute binary Se/Sp
+            tp = np.sum((pred_cls == 1) & (is_cls == 1))
+            fn = np.sum((pred_cls == 0) & (is_cls == 1))
+            tn = np.sum((pred_cls == 0) & (is_cls == 0))
+            fp = np.sum((pred_cls == 1) & (is_cls == 0))
+            
+            se = tp / (tp + fn + 1e-8)
+            sp = tn / (tn + fp + 1e-8)
+            
+            # Accept if satisfies constraint and improves sensitivity
+            if sp >= min_sp and se > best_se:
+                best_se = se
+                best_threshold = thresh
+        
+        best_thresholds[cls] = best_threshold
+        tuning_log[cls] = {"threshold": best_threshold, "sensitivity": best_se}
+    
+    print(f"\n  Thresholds tuned on validation set (min_sp={min_sp}):")
+    for cls in range(NUM_CLASSES):
+        print(f"    {LABEL_NAMES[cls]}: threshold={best_thresholds[cls]:.3f}, "
+              f"sensitivity={tuning_log[cls]['sensitivity']:.4f}")
+    
+    return best_thresholds, tuning_log
+
+
+def predict_with_thresholds(logits, thresholds):
+    """
+    Make predictions using per-class thresholds instead of argmax.
+    
+    WHY: Each class can have different decision boundary optimized for recall.
+    
+    Args:
+        logits: [B, num_classes] model outputs
+        thresholds: dict mapping class_id → threshold
+    
+    Returns:
+        preds: [B] predicted class indices
+    """
+    probs = torch.softmax(logits, dim=1)  # [B, 4]
+    batch_size = probs.shape[0]
+    preds = []
+    
+    for i in range(batch_size):
+        # Check which classes exceed their threshold
+        confident_classes = [
+            cls for cls in range(NUM_CLASSES) 
+            if probs[i, cls].item() >= thresholds[cls]
+        ]
+        
+        if confident_classes:
+            # Pick class with highest probability among confident ones
+            preds.append(max(confident_classes, key=lambda c: probs[i, c].item()))
+        else:
+            # Fallback to argmax if no class confident
+            preds.append(torch.argmax(probs[i]).item())
+    
+    return np.array(preds)
+
+
+# ─────────────────────────────────────────────
 # EVAL LOOP
 # ─────────────────────────────────────────────
-def evaluate(model, loader, criterion, device):
+def evaluate(model, loader, criterion, device, thresholds=None):
     model.eval()
     total_loss = 0.0
     all_preds, all_labels = [], []
+    all_logits = []
 
     with torch.no_grad():
         for mel, _, label in loader:
             mel = mel.to(device, non_blocking=True)
             logits = model(mel)
+            all_logits.append(logits.cpu())
+            
             # label est un int dans le test loader
             target = torch.tensor(label, dtype=torch.long).to(device) \
                      if not isinstance(label, torch.Tensor) \
@@ -120,7 +245,12 @@ def evaluate(model, loader, criterion, device):
             loss = criterion(logits, target)
             total_loss += loss.item()
 
-            preds = torch.argmax(logits, dim=1).cpu().tolist()
+            # Use thresholds if provided, otherwise use argmax
+            if thresholds is not None:
+                preds = predict_with_thresholds(logits, thresholds).tolist()
+            else:
+                preds = torch.argmax(logits, dim=1).cpu().tolist()
+            
             all_preds.extend(preds)
             all_labels.extend(
                 label.tolist() if isinstance(label, torch.Tensor) else list(label)
@@ -143,7 +273,7 @@ def evaluate(model, loader, criterion, device):
 # ─────────────────────────────────────────────
 # SAVE / LOAD
 # ─────────────────────────────────────────────
-def save_checkpoint(path, model, optimizer, epoch, phase, metrics, is_best=False):
+def save_checkpoint(path, model, optimizer, epoch, phase, metrics, thresholds=None, is_best=False):
     ckpt = {
         "epoch":        epoch,
         "phase":        phase,
@@ -155,6 +285,7 @@ def save_checkpoint(path, model, optimizer, epoch, phase, metrics, is_best=False
         "se":           metrics["se"],
         "sp":           metrics["sp"],
         "acc":          metrics["acc"],
+        "thresholds":   thresholds,  # Save optimized thresholds for sensitivity
     }
     torch.save(ckpt, path)
     tag = "★ BEST" if is_best else "last"
@@ -174,6 +305,8 @@ def load_checkpoint(path, model, optimizer=None):
             print("  Warning: état optimizer incompatible, ignoré.")
     print(f"  Checkpoint chargé : epoch {ckpt['epoch']} | phase {ckpt['phase']} "
           f"| score {ckpt['score']:.4f}")
+    if "thresholds" in ckpt and ckpt["thresholds"]:
+        print(f"  Thresholds loaded: {ckpt['thresholds']}")
     return ckpt
 
 
@@ -205,9 +338,18 @@ def phase1_warmup(model, train_loader, test_loader, criterion, device,
 
     history, best_score, best_epoch, no_improve = [], 0.0, 0, 0
 
+    debug = globals().get("DEBUG_TRAIN", False)
+    if debug:
+        try:
+            cls_w = model.classifier[-1].weight.detach().cpu().clone()
+            cls_b = model.classifier[-1].bias.detach().cpu().clone()
+            print(f"  [DEBUG] classifier last-linear mean={cls_w.mean():.6f}, bias_mean={cls_b.mean():.6f}")
+        except Exception:
+            print("  [DEBUG] unable to snapshot classifier params")
+
     print(f"\n{'Ep':>4} {'Phase':>8} {'TrLoss':>8} {'EvLoss':>8} "
-          f"{'Acc':>7} {'Se':>7} {'Sp':>7} {'Score':>8}")
-    print("-" * 70)
+          f"{'Se':>7} {'Sp':>7} {'Score':>8} | {'SeT':>7} {'SpT':>7} {'ScoreT':>8}")
+    print("-" * 95)
 
     for epoch in range(start_epoch, WARMUP_EPOCHS + 1):
         model.train()
@@ -215,9 +357,7 @@ def phase1_warmup(model, train_loader, test_loader, criterion, device,
 
         for i, (mel, target, _) in enumerate(train_loader, 1):
             mel    = mel.to(device, non_blocking=True)
-            target = torch.argmax(
-                target.to(device, non_blocking=True), dim=1
-            )
+            target = target.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type="cuda", enabled=(device == "cuda")):
@@ -231,29 +371,58 @@ def phase1_warmup(model, train_loader, test_loader, criterion, device,
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if debug and (i % LOG_EVERY == 0 or i == len(train_loader)):
+                # grad norm
+                total_norm = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                total_norm = total_norm ** 0.5
+                # param norm (classifier last layer)
+                try:
+                    cls_param_norm = model.classifier[-1].weight.data.norm().item()
+                except Exception:
+                    cls_param_norm = 0.0
+                print(f"      [DEBUG] batch {i} grad_norm={total_norm:.6f} cls_w_norm={cls_param_norm:.6f}")
             scaler.step(optimizer)
             scaler.update()
             running_loss += loss.item()
 
+            if i % LOG_EVERY == 0 or i == len(train_loader):
+                print(
+                    f"    [P1][ep {epoch}/{WARMUP_EPOCHS}] batch {i}/{len(train_loader)} "
+                    f"loss={running_loss / i:.4f}"
+                )
+
         scheduler.step()
 
-        metrics = evaluate(model, test_loader, criterion, device)
+        metrics_raw = evaluate(model, test_loader, criterion, device)
         avg_loss = running_loss / max(len(train_loader), 1)
 
-        print(f"{epoch:>4} {'warmup':>8} {avg_loss:>8.4f} {metrics['loss']:>8.4f} "
-              f"{metrics['acc']:>7.4f} {metrics['se']:>7.4f} "
-              f"{metrics['sp']:>7.4f} {metrics['score']:>8.4f}", end="")
+        # THRESHOLD TUNING: Find per-class thresholds to maximize sensitivity
+        # WHY: Medical audio should prioritize recall for abnormal classes
+        best_thresholds, _ = tune_thresholds_for_sensitivity(
+            model, test_loader, device, min_sp=MIN_SP
+        )
 
-        # Diagnostic collapse
-        pred_dist = dict(zip(LABEL_NAMES, metrics["pred_counts"].tolist()))
+        metrics_tuned = evaluate(model, test_loader, criterion, device, thresholds=best_thresholds)
+
+        print(f"{epoch:>4} {'warmup':>8} {avg_loss:>8.4f} {metrics_raw['loss']:>8.4f} "
+              f"{metrics_raw['se']:>7.4f} {metrics_raw['sp']:>7.4f} {metrics_raw['score']:>8.4f} | "
+              f"{metrics_tuned['se']:>7.4f} {metrics_tuned['sp']:>7.4f} {metrics_tuned['score']:>8.4f}", end="")
+
+        # Diagnostic collapse (sur prédictions tuned)
+        pred_dist = dict(zip(LABEL_NAMES, metrics_tuned["pred_counts"].tolist()))
         print(f"  preds={pred_dist}", end="")
 
-        improved = (metrics["score"] > best_score and metrics["sp"] > MIN_SP)
+        improved = (metrics_tuned["score"] > best_score and metrics_tuned["sp"] > MIN_SP)
         if improved:
-            best_score, best_epoch, no_improve = metrics["score"], epoch, 0
+            best_score, best_epoch, no_improve = metrics_tuned["score"], epoch, 0
             save_checkpoint(
                 os.path.join(ckpt_dir, "best_p1.pth"),
-                model, optimizer, epoch, "warmup", metrics, is_best=True
+                model, optimizer, epoch, "warmup", metrics_tuned,
+                thresholds=best_thresholds, is_best=True
             )
             print("  ← best", end="")
         else:
@@ -261,23 +430,24 @@ def phase1_warmup(model, train_loader, test_loader, criterion, device,
 
         save_checkpoint(
             os.path.join(ckpt_dir, "last_p1.pth"),
-            model, optimizer, epoch, "warmup", metrics
+            model, optimizer, epoch, "warmup", metrics_tuned,
+            thresholds=best_thresholds
         )
         print()
 
         # Rapport détaillé
         if epoch % 2 == 0 or epoch == WARMUP_EPOCHS:
             print(classification_report(
-                metrics["all_labels"], metrics["all_preds"],
+                metrics_tuned["all_labels"], metrics_tuned["all_preds"],
                 target_names=LABEL_NAMES, digits=3, zero_division=0
             ))
-            print_cm(metrics["cm"], LABEL_NAMES)
-            print(f"  True : {dict(zip(LABEL_NAMES, metrics['true_counts'].tolist()))}")
+            print_cm(metrics_tuned["cm"], LABEL_NAMES)
+            print(f"  True : {dict(zip(LABEL_NAMES, metrics_tuned['true_counts'].tolist()))}")
             print(f"  Pred : {pred_dist}")
 
         history.append({
             "epoch": epoch, "phase": "warmup",
-            "train_loss": avg_loss, **{k: v for k, v in metrics.items()
+            "train_loss": avg_loss, **{k: v for k, v in metrics_tuned.items()
                                        if k not in ("cm", "all_labels", "all_preds",
                                                     "pred_counts", "true_counts")}
         })
@@ -289,7 +459,14 @@ def phase1_warmup(model, train_loader, test_loader, criterion, device,
         if no_improve >= PATIENCE_P1:
             print(f"\n  Early stopping phase 1 à epoch {epoch}")
             break
-
+    if debug:
+        try:
+            cls_w_after = model.classifier[-1].weight.detach().cpu()
+            cls_b_after = model.classifier[-1].bias.detach().cpu()
+            mean_diff = (cls_w_after - cls_w).abs().mean().item()
+            print(f"  [DEBUG] classifier last-linear mean-abs-change after phase1: {mean_diff:.6f}")
+        except Exception:
+            pass
     print(f"\n  Meilleur score phase 1 : {best_score:.4f} (epoch {best_epoch})")
     return history, best_score
 
@@ -339,9 +516,18 @@ def phase2_finetune(model, train_loader, test_loader, criterion, device,
 
     history, best_score, best_epoch, no_improve = [], 0.0, 0, 0
 
+    debug = globals().get("DEBUG_TRAIN", False)
+    if debug:
+        try:
+            cls_w = model.classifier[-1].weight.detach().cpu().clone()
+            cls_b = model.classifier[-1].bias.detach().cpu().clone()
+            print(f"  [DEBUG] classifier last-linear mean(before)={cls_w.mean():.6f}")
+        except Exception:
+            print("  [DEBUG] unable to snapshot classifier params")
+
     print(f"\n{'Ep':>4} {'Phase':>8} {'TrLoss':>8} {'EvLoss':>8} "
-          f"{'Acc':>7} {'Se':>7} {'Sp':>7} {'Score':>8}")
-    print("-" * 70)
+          f"{'Se':>7} {'Sp':>7} {'Score':>8} | {'SeT':>7} {'SpT':>7} {'ScoreT':>8}")
+    print("-" * 95)
 
     for epoch in range(start_epoch, FINETUNE_EPOCHS + 1):
         model.train()
@@ -349,9 +535,7 @@ def phase2_finetune(model, train_loader, test_loader, criterion, device,
 
         for i, (mel, target, _) in enumerate(train_loader, 1):
             mel    = mel.to(device, non_blocking=True)
-            target = torch.argmax(
-                target.to(device, non_blocking=True), dim=1
-            )
+            target = target.to(device, non_blocking=True)
 
             # ── SAM first step ──────────────────────────────
             with torch.amp.autocast(device_type="cuda", enabled=(device == "cuda")):
@@ -366,10 +550,8 @@ def phase2_finetune(model, train_loader, test_loader, criterion, device,
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.first_step(zero_grad=True)
-            scaler.update()
 
             # ── SAM second step ─────────────────────────────
-            scaler = torch.amp.GradScaler(enabled=(device == "cuda"))  # reset scaler
             with torch.amp.autocast(device_type="cuda", enabled=(device == "cuda")):
                 logits2 = model(mel)
                 loss2   = criterion(logits2, target)
@@ -382,24 +564,51 @@ def phase2_finetune(model, train_loader, test_loader, criterion, device,
 
             running_loss += loss.item()
 
+            if i % LOG_EVERY == 0 or i == len(train_loader):
+                print(
+                    f"    [P2][ep {epoch}/{FINETUNE_EPOCHS}] batch {i}/{len(train_loader)} "
+                    f"loss={running_loss / i:.4f}"
+                )
+                if debug:
+                    # grad norm
+                    total_norm = 0.0
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            param_norm = p.grad.data.norm(2)
+                            total_norm += param_norm.item() ** 2
+                    total_norm = total_norm ** 0.5
+                    try:
+                        cls_param_norm = model.classifier[-1].weight.data.norm().item()
+                    except Exception:
+                        cls_param_norm = 0.0
+                    print(f"      [DEBUG] P2 batch {i} grad_norm={total_norm:.6f} cls_w_norm={cls_param_norm:.6f}")
+
         scheduler.step()
 
-        metrics = evaluate(model, test_loader, criterion, device)
+        metrics_raw = evaluate(model, test_loader, criterion, device)
         avg_loss = running_loss / max(len(train_loader), 1)
 
-        print(f"{epoch:>4} {'finetune':>8} {avg_loss:>8.4f} {metrics['loss']:>8.4f} "
-              f"{metrics['acc']:>7.4f} {metrics['se']:>7.4f} "
-              f"{metrics['sp']:>7.4f} {metrics['score']:>8.4f}", end="")
+        # THRESHOLD TUNING: Find per-class thresholds to maximize sensitivity
+        best_thresholds, _ = tune_thresholds_for_sensitivity(
+            model, test_loader, device, min_sp=MIN_SP
+        )
 
-        pred_dist = dict(zip(LABEL_NAMES, metrics["pred_counts"].tolist()))
+        metrics_tuned = evaluate(model, test_loader, criterion, device, thresholds=best_thresholds)
+
+        print(f"{epoch:>4} {'finetune':>8} {avg_loss:>8.4f} {metrics_raw['loss']:>8.4f} "
+              f"{metrics_raw['se']:>7.4f} {metrics_raw['sp']:>7.4f} {metrics_raw['score']:>8.4f} | "
+              f"{metrics_tuned['se']:>7.4f} {metrics_tuned['sp']:>7.4f} {metrics_tuned['score']:>8.4f}", end="")
+
+        pred_dist = dict(zip(LABEL_NAMES, metrics_tuned["pred_counts"].tolist()))
         print(f"  preds={pred_dist}", end="")
 
-        improved = (metrics["score"] > best_score and metrics["sp"] > MIN_SP)
+        improved = (metrics_tuned["score"] > best_score and metrics_tuned["sp"] > MIN_SP)
         if improved:
-            best_score, best_epoch, no_improve = metrics["score"], epoch, 0
+            best_score, best_epoch, no_improve = metrics_tuned["score"], epoch, 0
             save_checkpoint(
                 os.path.join(ckpt_dir, "best_model.pth"),
-                model, optimizer, epoch, "finetune", metrics, is_best=True
+                model, optimizer, epoch, "finetune", metrics_tuned,
+                thresholds=best_thresholds, is_best=True
             )
             print("  ← best", end="")
         else:
@@ -407,22 +616,23 @@ def phase2_finetune(model, train_loader, test_loader, criterion, device,
 
         save_checkpoint(
             os.path.join(ckpt_dir, "last_p2.pth"),
-            model, optimizer, epoch, "finetune", metrics
+            model, optimizer, epoch, "finetune", metrics_tuned,
+            thresholds=best_thresholds
         )
         print()
 
         if epoch % 5 == 0 or epoch == 1:
             print(classification_report(
-                metrics["all_labels"], metrics["all_preds"],
+                metrics_tuned["all_labels"], metrics_tuned["all_preds"],
                 target_names=LABEL_NAMES, digits=3, zero_division=0
             ))
-            print_cm(metrics["cm"], LABEL_NAMES)
-            print(f"  True : {dict(zip(LABEL_NAMES, metrics['true_counts'].tolist()))}")
+            print_cm(metrics_tuned["cm"], LABEL_NAMES)
+            print(f"  True : {dict(zip(LABEL_NAMES, metrics_tuned['true_counts'].tolist()))}")
             print(f"  Pred : {pred_dist}")
 
         history.append({
             "epoch": epoch, "phase": "finetune",
-            "train_loss": avg_loss, **{k: v for k, v in metrics.items()
+            "train_loss": avg_loss, **{k: v for k, v in metrics_tuned.items()
                                        if k not in ("cm", "all_labels", "all_preds",
                                                     "pred_counts", "true_counts")}
         })
@@ -436,6 +646,13 @@ def phase2_finetune(model, train_loader, test_loader, criterion, device,
             break
 
     print(f"\n  Meilleur score phase 2 : {best_score:.4f} (epoch {best_epoch})")
+    if debug:
+        try:
+            cls_w_after = model.classifier[-1].weight.detach().cpu()
+            mean_diff = (cls_w_after - cls_w).abs().mean().item()
+            print(f"  [DEBUG] classifier last-linear mean-abs-change after phase2: {mean_diff:.6f}")
+        except Exception:
+            pass
     return history, best_score
 
 
@@ -443,6 +660,7 @@ def phase2_finetune(model, train_loader, test_loader, criterion, device,
 # MAIN
 # ─────────────────────────────────────────────
 def main():
+    global WARMUP_EPOCHS, FINETUNE_EPOCHS
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume",    type=str,  default=None,
                         help="Chemin vers un checkpoint pour reprendre")
@@ -450,7 +668,18 @@ def main():
                         help="0=les deux phases | 1=warmup only | 2=finetune only")
     parser.add_argument("--warmup_ep", type=int,  default=WARMUP_EPOCHS)
     parser.add_argument("--fine_ep",   type=int,  default=FINETUNE_EPOCHS)
+    parser.add_argument("--log_every", type=int,  default=50,
+                        help="Print intra-epoch logs every N batches")
+    parser.add_argument("--no_sampler", action="store_true",
+                        help="Disable WeightedRandomSampler (use shuffle)")
+    parser.add_argument("--debug_train", action="store_true",
+                        help="Enable extra per-batch gradient/param debug logs")
     args = parser.parse_args()
+
+    WARMUP_EPOCHS = max(1, int(args.warmup_ep))
+    FINETUNE_EPOCHS = max(1, int(args.fine_ep))
+    LOG_EVERY = max(1, int(args.log_every))
+    DEBUG_TRAIN = bool(args.debug_train)
 
     os.makedirs(CKPT_DIR, exist_ok=True)
     os.makedirs(RES_DIR,  exist_ok=True)
@@ -464,19 +693,28 @@ def main():
 
     # WeightedRandomSampler avec inv count (pas sqrt) → meilleure correction
     sample_weights = [1.0 / counts[l] for l in labels_arr]
-    sampler = WeightedRandomSampler(
-        weights=torch.DoubleTensor(sample_weights),
-        num_samples=len(sample_weights),
-        replacement=True,
-    )
+    if args.no_sampler:
+        sampler_obj = None
+    else:
+        sampler_obj = WeightedRandomSampler(
+            weights=torch.DoubleTensor(sample_weights),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
 
-    train_loader = DataLoader(
-        train_dataset, batch_size=BATCH_SIZE,
-        sampler=sampler, num_workers=0, pin_memory=True,
-    )
+    if sampler_obj is not None:
+        train_loader = DataLoader(
+            train_dataset, batch_size=BATCH_SIZE,
+            sampler=sampler_obj, num_workers=4, pin_memory=True,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset, batch_size=BATCH_SIZE,
+            shuffle=True, num_workers=4, pin_memory=True,
+        )
     test_loader = DataLoader(
         test_dataset, batch_size=BATCH_SIZE,
-        shuffle=False, num_workers=0, pin_memory=True,
+        shuffle=False, num_workers=4, pin_memory=True,
     )
 
     # ── Modèle ──────────────────────────────────────────────────
@@ -489,10 +727,12 @@ def main():
     p = model.get_trainable_params()
     print(f"Params total : {p['total_M']:.2f}M | Entraînables : {p['trainable_M']:.2f}M")
 
-    # ── Loss avec class weights INV (pas sqrt) ──────────────────
-    # inv count = contraste fort, indispensable quand le modèle collapse
-    class_weights = build_class_weights(counts.tolist(), DEVICE, mode="inv")
-    criterion     = nn.CrossEntropyLoss(weight=class_weights)
+    # ── Loss avec Focal Loss + class weights ─────────────────────
+    # CHANGE: Replaced CrossEntropyLoss with FocalLoss
+    # WHY: Focal loss down-weights easy examples, focuses on hard negatives.
+    # Critical for imbalanced medical audio where sensitivity matters most.
+    class_weights = build_class_weights(counts.tolist(), DEVICE)
+    criterion     = FocalLoss(gamma=2.0, alpha=class_weights, reduction='mean')
 
     # ── Resume ──────────────────────────────────────────────────
     start_phase = 1
